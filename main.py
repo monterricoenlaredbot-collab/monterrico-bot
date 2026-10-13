@@ -99,6 +99,7 @@ class Monitor:
         self.seq = 1
         self.monitored = {}  # raceId -> (raceCardId, raceNumber, date)
         self.status = {}
+        self.v3_status = {}  # Estado individual: fuente prioritaria frente al catálogo.
         self.results = {}
         self.ready = False
 
@@ -142,7 +143,13 @@ class Monitor:
                     # Evitar redistribuir de golpe carreras ya terminadas al iniciar.
                     continue
                 self.monitored[race_id] = (card_id, number, card_date)
-                self.status[race_id] = current_status
+                # Corrección: el catálogo puede estar atrasado respecto al canal
+                # individual v3. Nunca pisar un estado confirmado por v3.
+                if race_id not in self.v3_status:
+                    self.status[race_id] = current_status
+                elif current_status != self.v3_status[race_id]:
+                    print(f"[SYNC] Carrera {number}: catálogo={current_status}; "
+                          f"v3={self.v3_status[race_id]} (prioridad a v3)", flush=True)
                 self.subscribe(f"/broker/v3.race.{race_id}.es-PR")
                 self.subscribe(f"/broker/v2.race.{race_id}.es-PR.result")
                 self.emit_if_ready(race_id)
@@ -167,10 +174,25 @@ class Monitor:
             return
         if destination == f"/broker/v3.race.{race_id}.es-PR":
             if payload.get("raceCardId") == self.monitored[race_id][0]:
-                self.status[race_id] = payload.get("status")
+                new_status = payload.get("status")
+                previous = self.v3_status.get(race_id)
+                self.v3_status[race_id] = new_status
+                self.status[race_id] = new_status
+                if previous != new_status:
+                    print(f"[RECIBIDO {datetime.now(LOCAL_TZ).isoformat(timespec='seconds')}] "
+                          f"Carrera {self.monitored[race_id][1]} v3 estado={new_status}", flush=True)
         elif destination == f"/broker/v2.race.{race_id}.es-PR.result":
             if payload.get("raceId") == race_id:
+                previous_result = self.results.get(race_id)
                 self.results[race_id] = payload
+                if (previous_result is None or
+                    previous_result.get('complete') != payload.get('complete') or
+                    len(previous_result.get('exoticBetsResults') or []) != len(payload.get('exoticBetsResults') or [])):
+                    print(f"[RECIBIDO {datetime.now(LOCAL_TZ).isoformat(timespec='seconds')}] "
+                          f"Carrera {self.monitored[race_id][1]} result "
+                          f"complete={payload.get('complete')} "
+                          f"posiciones={len(payload.get('runnersResults') or [])} "
+                          f"dividendos={len(payload.get('exoticBetsResults') or [])}", flush=True)
         else:
             return
         self.emit_if_ready(race_id)
@@ -197,6 +219,8 @@ class Monitor:
         inserted = self.db.insert_outbox(race_id, card_id, message, digest)
         if not inserted:
             return
+        print(f"[GUARDADO {datetime.now(LOCAL_TZ).isoformat(timespec='seconds')}] "
+              f"Carrera {race_number}: Supabase insertado", flush=True)
         print("\n" + "="*50 + "\n" + message + "\n" + "="*50 + "\n", flush=True)
         print("Resultado guardado en cola (PENDIENTE: integrar envío a WhatsApp).", flush=True)
 
