@@ -12,7 +12,7 @@ import secrets
 import sys
 import time
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from urllib.parse import urlsplit
 from storage import make_store
 from zoneinfo import ZoneInfo
@@ -89,6 +89,33 @@ def format_result(card_id: int, race_number: int, data: dict) -> str:
             lines.append(f"{name}{base} [{combination}]: {money(item['payout'])}")
     lines += ["", "Fuente: Telepódromo", f"Cartilla: {card_id}"]
     return "\n".join(lines)
+
+
+def positive_amount(value: object) -> bool:
+    """True solo para importes realmente publicados y mayores que cero."""
+    if value is None or isinstance(value, bool):
+        return False
+    try:
+        number = Decimal(str(value).strip())
+        return number.is_finite() and number > 0
+    except (InvalidOperation, ValueError, TypeError):
+        return False
+
+
+def payout_readiness(result: dict) -> tuple[bool, int]:
+    """Verifica ganador pagado y cuenta dividendos exóticos utilizables.
+
+    La fuente puede marcar complete=False varios minutos DESPUÉS de publicar
+    dividendos. Solo la condición de completitud no decide nuestro envío.
+    """
+    runners = result.get('runnersResults') or []
+    winner = next((r for r in runners if isinstance(r, dict) and r.get('position') == 1), None)
+    winner_payout = ((winner or {}).get('payouts') or {}).get('win')
+    valid_exotics = sum(
+        1 for e in (result.get('exoticBetsResults') or [])
+        if isinstance(e, dict) and positive_amount(e.get('payout'))
+    )
+    return positive_amount(winner_payout), valid_exotics
 
 
 class Monitor:
@@ -201,14 +228,24 @@ class Monitor:
         if self.status.get(race_id) != OFFICIAL_STATUS:
             return
         result = self.results.get(race_id)
-        if not result or result.get("complete") is not True:
-            return
-        if not result.get("runnersResults"):
+        if not result or not result.get("runnersResults"):
             return
         card_id, race_number, _ = self.monitored[race_id]
         if result.get("raceNumber") != race_number:
             print(f"Inconsistencia carrera {race_id}; no se publica.", file=sys.stderr)
             return
+        has_win, exotics_count = payout_readiness(result)
+        if not has_win:
+            # No encolar con el marcador solo (16:29); esperar los dividendos.
+            return
+        early_enabled = os.getenv('MON_EARLY_PUBLISH', '1').strip().lower() not in ('0', 'false', 'no', 'off')
+        if result.get('complete') is not True:
+            # Para emitir temprano exigimos status oficial, al menos los tres
+            # primeros del marcador, Ganador pagado y al menos UN dividendo
+            # exótico con importe. No enviamos un marcador parcial sin pagos.
+            # Si no hay exóticos, complete=True sigue siendo el respaldo.
+            if not early_enabled or exotics_count == 0 or len(result.get('runnersResults') or []) < 3:
+                return
         message = format_result(card_id, race_number, result)
         digest = hashlib.sha256(message.encode("utf-8")).hexdigest()
         previous = self.db.existing_digest(race_id)
@@ -219,8 +256,13 @@ class Monitor:
         inserted = self.db.insert_outbox(race_id, card_id, message, digest)
         if not inserted:
             return
+        if result.get('complete') is not True:
+            print(f"[TEMPRANO {datetime.now(LOCAL_TZ).isoformat(timespec='seconds')}] "
+                  f"Carrera {race_number}: oficial + ganador pagado + "
+                  f"{exotics_count} exóticos; no espera complete=True", flush=True)
         print(f"[GUARDADO {datetime.now(LOCAL_TZ).isoformat(timespec='seconds')}] "
-              f"Carrera {race_number}: Supabase insertado", flush=True)
+              f"Carrera {race_number}: Supabase insertado "
+              f"(complete={result.get('complete')})", flush=True)
         print("\n" + "="*50 + "\n" + message + "\n" + "="*50 + "\n", flush=True)
         print("Resultado guardado en cola (PENDIENTE: integrar envío a WhatsApp).", flush=True)
 
